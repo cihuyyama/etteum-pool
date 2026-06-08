@@ -15,6 +15,7 @@ import { Plus, Upload, RefreshCw, Play, RotateCcw, Flame } from "lucide-react";
 import { Progress } from "@/components/ui/progress";
 import { useWsEvent } from "@/hooks/useWebSocket";
 import {
+  completeCodexOAuthCallbackUrl,
   createAccount,
   fetchAccounts,
   fetchApi,
@@ -22,9 +23,13 @@ import {
   fetchAutoWarmupStatus,
   fetchSettings,
   fetchWarmupQueue,
+  getCodexAuthorize,
   importAccounts,
   loginAccounts,
   loginAllAccounts,
+  pollCodexOAuthStatus,
+  startCodexOAuthProxy,
+  stopCodexOAuth,
   updateSettings,
   warmupAllAccounts,
   type AutoWarmupStatus,
@@ -73,9 +78,15 @@ export default function Accounts() {
   const [bulkBrowserEngine, setBulkBrowserEngine] = useState("camoufox");
   const [bulkHeadless, setBulkHeadless] = useState(true);
   const [bulkConcurrency, setBulkConcurrency] = useState(3);
+  const [codexOauthBusy, setCodexOauthBusy] = useState(false);
+  const [codexOauthAuthUrl, setCodexOauthAuthUrl] = useState("");
+  const [codexOauthCallbackUrl, setCodexOauthCallbackUrl] = useState("");
   const [loginPendingDialog, setLoginPendingDialog] = useState(false);
   const [loginPendingConcurrency, setLoginPendingConcurrency] = useState(2);
   const messageTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const codexOauthPopupRef = useRef<Window | null>(null);
+  const codexOauthPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const codexOauthStateRef = useRef<string | null>(null);
   const loadingRef = useRef(false);
 
   async function load() {
@@ -168,6 +179,18 @@ export default function Accounts() {
   useEffect(() => () => {
     if (reloadRef.current) clearTimeout(reloadRef.current);
     if (warmupReloadRef.current) clearTimeout(warmupReloadRef.current);
+    if (codexOauthPollRef.current) clearInterval(codexOauthPollRef.current);
+    if (codexOauthStateRef.current) {
+      stopCodexOAuth(codexOauthStateRef.current).catch(() => {});
+    }
+    codexOauthPopupRef.current?.close();
+  }, []);
+
+  useEffect(() => {
+    const pollId = codexOauthPollRef.current;
+    return () => {
+      if (pollId) clearInterval(pollId);
+    };
   }, []);
 
   useWsEvent(["auto_warmup_status"], (msg) => {
@@ -277,6 +300,196 @@ export default function Accounts() {
       await load();
       navigate("/bot-logs");
     } catch (err) { showError(err); }
+  }
+
+  function clearCodexOAuthPolling() {
+    if (codexOauthPollRef.current) {
+      clearInterval(codexOauthPollRef.current);
+      codexOauthPollRef.current = null;
+    }
+  }
+
+  function resetCodexOAuthFlow() {
+    clearCodexOAuthPolling();
+    codexOauthPopupRef.current?.close();
+    codexOauthPopupRef.current = null;
+    codexOauthStateRef.current = null;
+    setCodexOauthBusy(false);
+    setCodexOauthAuthUrl("");
+    setCodexOauthCallbackUrl("");
+  }
+
+  async function safeCopyText(text: string, successMessage: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      showSuccess(successMessage);
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  function isCodexCallbackUrlValid(value: string) {
+    try {
+      const url = new URL(value.trim());
+      return !!url.searchParams.get("code") && !!url.searchParams.get("state");
+    } catch {
+      return false;
+    }
+  }
+
+  const hasPreparedCodexOAuth = !!codexOauthStateRef.current && !!codexOauthAuthUrl;
+  const codexCallbackReady = isCodexCallbackUrlValid(codexOauthCallbackUrl);
+  const codexCallbackExample = "http://localhost:1455/auth/callback?code=...&state=...";
+  const codexLoopbackUrl = "http://localhost:1455/auth/callback";
+
+  async function startCodexOAuthSession() {
+    const redirectUri = codexLoopbackUrl;
+    const appPort = window.location.port || (window.location.protocol === "https:" ? "443" : "80");
+    const auth = await getCodexAuthorize(redirectUri);
+    await startCodexOAuthProxy({
+      appPort,
+      state: auth.state,
+      codeVerifier: auth.codeVerifier,
+      redirectUri: auth.redirectUri,
+    });
+    codexOauthStateRef.current = auth.state;
+    setCodexOauthAuthUrl(auth.authUrl);
+    setCodexOauthCallbackUrl("");
+    return auth;
+  }
+
+  function finishCodexOAuthSuccess(status: Awaited<ReturnType<typeof pollCodexOAuthStatus>>) {
+    resetCodexOAuthFlow();
+    showSuccess(`Codex connected: ${status.connection?.displayName || status.connection?.email || "account added"}`);
+    setAddDialogProvider(null);
+    load();
+  }
+
+  function beginCodexOAuthPolling() {
+    clearCodexOAuthPolling();
+    codexOauthPollRef.current = setInterval(async () => {
+      const state = codexOauthStateRef.current;
+      if (!state) return;
+
+      try {
+        const status = await pollCodexOAuthStatus(state);
+        if (status.status === "done") {
+          finishCodexOAuthSuccess(status);
+          return;
+        }
+
+        if (status.status === "error" || status.status === "cancelled" || status.status === "not_found") {
+          resetCodexOAuthFlow();
+          showError(new Error(status.error || "Codex OAuth failed"));
+        }
+      } catch (pollError) {
+        resetCodexOAuthFlow();
+        showError(pollError);
+      }
+    }, 1500);
+  }
+
+  async function handleCodexOAuthLogin() {
+    if (codexOauthBusy) return;
+    setCodexOauthBusy(true);
+    setError(null);
+
+    try {
+      const auth = await startCodexOAuthSession();
+      codexOauthPopupRef.current = window.open(auth.authUrl, "codex_oauth_popup", "width=640,height=800");
+      if (!codexOauthPopupRef.current) {
+        window.open(auth.authUrl, "_blank", "noopener,noreferrer");
+      }
+      beginCodexOAuthPolling();
+    } catch (err) {
+      resetCodexOAuthFlow();
+      showError(err);
+    }
+  }
+
+  async function handleCodexOAuthPrepareManual() {
+    if (codexOauthBusy || hasPreparedCodexOAuth) return;
+    setCodexOauthBusy(true);
+    setError(null);
+
+    try {
+      await startCodexOAuthSession();
+      beginCodexOAuthPolling();
+      setCodexOauthBusy(false);
+      showSuccess("Auth URL ready. Open it, login, lalu paste callback URL di bawah.");
+    } catch (err) {
+      resetCodexOAuthFlow();
+      showError(err);
+    }
+  }
+
+  async function handleCodexOAuthSubmitManual() {
+    if (codexOauthBusy || !codexCallbackReady) return;
+    setCodexOauthBusy(true);
+    setError(null);
+
+    try {
+      await completeCodexOAuthCallbackUrl(codexOauthCallbackUrl);
+      const state = codexOauthStateRef.current;
+      if (!state) {
+        resetCodexOAuthFlow();
+        showSuccess("Codex connected");
+        setAddDialogProvider(null);
+        await load();
+        return;
+      }
+      const status = await pollCodexOAuthStatus(state);
+      finishCodexOAuthSuccess(status);
+    } catch (err) {
+      setCodexOauthBusy(false);
+      showError(err);
+    }
+  }
+
+  async function handleCodexOAuthCopyAuthUrl() {
+    if (!codexOauthAuthUrl) return;
+    await safeCopyText(codexOauthAuthUrl, "Auth URL copied");
+  }
+
+  function handleCodexOAuthOpenManual() {
+    if (!codexOauthAuthUrl) return;
+    window.open(codexOauthAuthUrl, "_blank", "noopener,noreferrer");
+  }
+
+  async function handleCodexOAuthPasteCallback() {
+    try {
+      const text = await navigator.clipboard.readText();
+      setCodexOauthCallbackUrl(text);
+    } catch (err) {
+      showError(err);
+    }
+  }
+
+  function handleOpenAddDialog(provider: Provider) {
+    resetCodexOAuthFlow();
+    if (provider === "codex") {
+      setAddMode("pat");
+    }
+    setAddDialogProvider(provider);
+  }
+
+  function handleCloseAddDialog() {
+    const state = codexOauthStateRef.current;
+    resetCodexOAuthFlow();
+    if (state) {
+      stopCodexOAuth(state).catch(() => {});
+    }
+    setAddDialogProvider(null);
+  }
+
+  function handleSetCodexMode(mode: typeof addMode) {
+    if (mode === addMode) return;
+    const state = codexOauthStateRef.current;
+    resetCodexOAuthFlow();
+    if (state) {
+      stopCodexOAuth(state).catch(() => {});
+    }
+    setAddMode(mode);
   }
 
   async function handleLoginAll() {
@@ -459,7 +672,7 @@ export default function Accounts() {
 
               {/* Buttons */}
               <div className="grid grid-cols-3 gap-2" onClick={(e) => e.stopPropagation()}>
-                <Button className="w-full" variant="default" size="sm" onClick={() => setAddDialogProvider(stat.provider)}>
+                <Button className="w-full" variant="default" size="sm" onClick={() => handleOpenAddDialog(stat.provider)}>
                   <Plus className="mr-1 h-4 w-4" /> Add
                 </Button>
                 <Button className="w-full" variant="outline" size="sm" onClick={() => handleWarmupProvider(stat.provider)} disabled={Boolean(warmupProgress[stat.provider])}>
@@ -476,7 +689,7 @@ export default function Accounts() {
 
       {/* Login Pending Dialog */}
       <Dialog open={loginPendingDialog} onOpenChange={setLoginPendingDialog}>
-        <DialogContent>
+        <DialogContent className="max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DTitle>Login Pending Accounts</DTitle>
             <DialogDescription>Choose how many accounts to login concurrently.</DialogDescription>
@@ -501,8 +714,11 @@ export default function Accounts() {
       </Dialog>
 
       {/* Add Account Dialog (per-provider) */}
-      <Dialog open={addDialogProvider !== null} onOpenChange={(open) => { if (!open) setAddDialogProvider(null); }}>
-        <DialogContent>
+      <Dialog open={addDialogProvider !== null} onOpenChange={(open) => {
+        if (open) return;
+        handleCloseAddDialog();
+      }}>
+        <DialogContent className="max-h-[85vh] overflow-y-auto">
           <DialogHeader>
             <DTitle>Add {addDialogProvider ? labelProvider(addDialogProvider) : ""} Account</DTitle>
             <DialogDescription>
@@ -520,10 +736,13 @@ export default function Accounts() {
               <button onClick={() => setAddMode("instant")}
                 className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "instant" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
               >Instant Login (Token)</button>
-              <button onClick={() => setAddMode("bulk")}
+              {addDialogProvider === "codex" && <button onClick={() => handleSetCodexMode("pat")}
+                className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "pat" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
+              >OAuth Login</button>}
+              <button onClick={() => addDialogProvider === "codex" ? handleSetCodexMode("bulk") : setAddMode("bulk")}
                 className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "bulk" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
               >Bulk (Email|Pass)</button>
-              <button onClick={() => setAddMode("single")}
+              <button onClick={() => addDialogProvider === "codex" ? handleSetCodexMode("single") : setAddMode("single")}
                 className={`flex-1 rounded px-3 py-1.5 text-xs font-medium transition-colors ${addMode === "single" ? "bg-[var(--background)] text-[var(--foreground)] shadow-sm" : "text-[var(--muted-foreground)]"}`}
               >Single</button>
             </div>
@@ -550,7 +769,7 @@ export default function Accounts() {
             </div>
           )}
 
-          {/* Personal Access Token mode (Qoder only) */}
+          {/* Token / OAuth mode */}
           {addMode === "pat" && addDialogProvider === "qoder" && (
             <div className="space-y-4">
               <div>
@@ -566,6 +785,69 @@ export default function Accounts() {
               <div className="flex justify-end gap-2">
                 <Button variant="outline" onClick={() => setAddDialogProvider(null)}>Cancel</Button>
                 <Button onClick={handleCookieLogin}>Add Account</Button>
+              </div>
+            </div>
+          )}
+
+          {addMode === "pat" && addDialogProvider === "codex" && (
+            <div className="space-y-3">
+              <div className="rounded-md border border-[var(--border)] bg-[var(--secondary)]/30 p-3 text-sm text-[var(--muted-foreground)]">
+                Login Codex bisa via popup OpenAI atau mode manual: generate auth URL, buka, lalu paste callback URL.
+              </div>
+
+              <div className="flex flex-col gap-2 sm:flex-row sm:justify-end">
+                <Button variant="outline" size="sm" onClick={handleCodexOAuthPrepareManual} disabled={codexOauthBusy || hasPreparedCodexOAuth}>
+                  {hasPreparedCodexOAuth ? "Manual Ready" : codexOauthBusy ? "Preparing..." : "Prepare Manual"}
+                </Button>
+                <Button size="sm" onClick={handleCodexOAuthLogin} disabled={codexOauthBusy || hasPreparedCodexOAuth}>
+                  {codexOauthBusy ? "Waiting for OAuth..." : "Start OAuth Login"}
+                </Button>
+              </div>
+
+              {hasPreparedCodexOAuth && (
+                <div className="space-y-3 rounded-md border border-[var(--border)] p-3">
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="text-sm text-[var(--foreground)]">Auth URL</label>
+                      <div className="flex gap-2">
+                        <Button size="sm" variant="outline" onClick={handleCodexOAuthCopyAuthUrl}>Copy</Button>
+                        <Button size="sm" variant="outline" onClick={handleCodexOAuthOpenManual}>Open</Button>
+                      </div>
+                    </div>
+                    <textarea
+                      value={codexOauthAuthUrl}
+                      readOnly
+                      className="w-full h-20 rounded-md border border-[var(--border)] bg-[var(--background)] p-3 text-xs font-mono text-[var(--foreground)] focus:outline-none resize-none"
+                    />
+                  </div>
+
+                  <div className="rounded-md bg-[var(--secondary)]/30 p-3 text-xs text-[var(--muted-foreground)] space-y-1.5">
+                    <p><span className="text-[var(--foreground)]">Callback:</span> <code className="break-all">{codexLoopbackUrl}</code></p>
+                    <p><span className="text-[var(--foreground)]">Contoh:</span> <code className="break-all">{codexCallbackExample}</code></p>
+                  </div>
+
+                  <div className="space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <label className="text-sm text-[var(--foreground)]">Callback URL</label>
+                      <Button size="sm" variant="outline" onClick={handleCodexOAuthPasteCallback} disabled={codexOauthBusy}>Paste</Button>
+                    </div>
+                    <textarea
+                      value={codexOauthCallbackUrl}
+                      onChange={(e) => setCodexOauthCallbackUrl(e.target.value)}
+                      className="w-full h-20 rounded-md border border-[var(--border)] bg-[var(--background)] p-3 text-xs font-mono text-[var(--foreground)] placeholder:text-[var(--muted-foreground)] focus:outline-none focus:ring-1 focus:ring-[var(--ring)] resize-none"
+                      placeholder={codexCallbackExample}
+                    />
+                    <div className="flex justify-end">
+                      <Button size="sm" onClick={handleCodexOAuthSubmitManual} disabled={codexOauthBusy || !codexCallbackReady}>
+                        {codexOauthBusy ? "Completing OAuth..." : "Submit Callback URL"}
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-1">
+                <Button size="sm" variant="outline" onClick={handleCloseAddDialog} disabled={codexOauthBusy && !hasPreparedCodexOAuth}>Cancel</Button>
               </div>
             </div>
           )}

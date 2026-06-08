@@ -18,6 +18,7 @@ const ProxyPool = lazy(() => import("./pages/ProxyPool"));
 const ImageStudio = lazy(() => import("./pages/ImageStudio"));
 const FilterRules = lazy(() => import("./pages/FilterRules"));
 const Integration = lazy(() => import("./pages/Integration"));
+const CodexOAuthCallback = lazy(() => import("./pages/CodexOAuthCallback"));
 
 function RouteFallback() {
   return <div className="flex h-64 items-center justify-center text-sm text-[var(--muted-foreground)]">Loading...</div>;
@@ -79,6 +80,7 @@ export default function App() {
           <Route path="/filter-rules" element={<FilterRules />} />
           <Route path="/integration" element={<Integration />} />
           <Route path="/image-studio" element={<ImageStudio />} />
+          <Route path="/oauth/codex/callback" element={<CodexOAuthCallback />} />
         </Route>
       </Routes>
     </Suspense>

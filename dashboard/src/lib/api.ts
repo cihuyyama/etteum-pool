@@ -550,3 +550,80 @@ export async function clearResults(chatId?: number): Promise<{ ok: boolean }> {
   const suffix = chatId !== undefined ? `?chatId=${chatId}` : "";
   return fetchApi(`/api/image-studio/results${suffix}`, { method: "DELETE" });
 }
+
+export interface CodexAuthorizeResponse {
+  authUrl: string;
+  state: string;
+  codeVerifier: string;
+  codeChallenge: string;
+  redirectUri: string;
+  flowType: string;
+  fixedPort: number;
+  callbackPath: string;
+}
+
+export interface CodexOAuthStatusResponse {
+  status: string;
+  error?: string;
+  connection?: {
+    id: number;
+    provider: string;
+    email: string;
+    displayName: string;
+    workspace?: string | null;
+    plan?: string | null;
+  };
+}
+
+export async function getCodexAuthorize(redirectUri: string): Promise<CodexAuthorizeResponse> {
+  return fetchApi(`/api/oauth/codex/authorize?redirect_uri=${encodeURIComponent(redirectUri)}`);
+}
+
+export async function startCodexOAuthProxy(input: {
+  appPort: string;
+  state: string;
+  codeVerifier: string;
+  redirectUri: string;
+}) {
+  const params = new URLSearchParams({
+    app_port: input.appPort,
+    state: input.state,
+    code_verifier: input.codeVerifier,
+    redirect_uri: input.redirectUri,
+  });
+  return fetchApi(`/api/oauth/codex/start-proxy?${params.toString()}`);
+}
+
+export async function pollCodexOAuthStatus(state: string): Promise<CodexOAuthStatusResponse> {
+  return fetchApi(`/api/oauth/codex/poll-status?state=${encodeURIComponent(state)}`);
+}
+
+export async function stopCodexOAuth(state?: string) {
+  const suffix = state ? `?state=${encodeURIComponent(state)}` : "";
+  return fetchApi(`/api/oauth/codex/stop-proxy${suffix}`);
+}
+
+export async function completeCodexOAuth(input: { code: string; state: string }) {
+  return fetchApi<{ success: boolean; connection?: CodexOAuthStatusResponse["connection"] }>("/api/oauth/codex/complete", {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
+export async function completeCodexOAuthCallbackUrl(callbackUrl: string) {
+  const url = new URL(callbackUrl.trim());
+  const code = url.searchParams.get("code") || "";
+  const state = url.searchParams.get("state") || "";
+  const error = url.searchParams.get("error") || "";
+  const errorDescription = url.searchParams.get("error_description") || error;
+
+  if (error) {
+    throw new Error(errorDescription || error);
+  }
+
+  if (!code || !state) {
+    throw new Error("Callback URL must include code and state");
+  }
+
+  return completeCodexOAuth({ code, state });
+}
